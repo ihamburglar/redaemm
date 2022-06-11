@@ -14,7 +14,6 @@
 package handlers
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"sort"
@@ -134,7 +133,6 @@ func ListRoutesHandler(res http.ResponseWriter, req *http.Request) {
 	if len(trimmedRoutes) == 0 {
 		formatRoutes()
 	}
-	fmt.Println(versionsPath)
 	// these paths do not use routeLookupTable due to inconsistency of trailing "/" with IMDS
 	switch req.URL.Path {
 	case basePath:
