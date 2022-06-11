@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# Script to update AEMM and Helm chart versions.
+# The following files are updated:
+## - helm charts' Chart.yaml
+## - helm charts' values.yaml
+## - helm charts' README
+## - README.md
+## - version.txt
+
+# This script is run AFTER creating a new local tag (see `make release-prep`).
+
+set -euo pipefail
+
+REPO_ROOT_PATH="$( cd "$(dirname "$0")"; cd ../; pwd -P )"
+MAKEFILE_PATH=$REPO_ROOT_PATH/Makefile
+LATEST_VERSION=$(make -s -f $MAKEFILE_PATH latest-release-tag | cut -b 2- )
+PREVIOUS_VERSION=$(make -s -f $MAKEFILE_PATH previous-release-tag | cut -b 2- )
+
+# Files to update
+REPO_README=$REPO_ROOT_PATH/README.md
+APP_VERSION=$REPO_ROOT_PATH/pkg/cmd/root/version.txt
+CHART=$REPO_ROOT_PATH/helm/amazon-ec2-metadata-mock/Chart.yaml
+CHART_VALUES=$REPO_ROOT_PATH/helm/amazon-ec2-metadata-mock/values.yaml
+CHART_README=$REPO_ROOT_PATH/helm/amazon-ec2-metadata-mock/README.md
+
+FILES=("$REPO_README"  "$CHART"  "$CHART_README"  "$CHART_VALUES" "$APP_VERSION")
+FILES_CHANGED=()
+
+echo -e "🥑 Attempting to update AEMM release version and Helm chart version in preparation for a new release.\n   Previous version: $PREVIOUS_VERSION ---> Latest version: $LATEST_VERSION"
+
+for f in "${FILES[@]}"; do
+    has_incorrect_version=$(cat $f | grep $PREVIOUS_VERSION)
+    if [[ ! -z  $has_incorrect_version ]]; then
+        sed -i '' "s/$PREVIOUS_VERSION/$LATEST_VERSION/g" $f
+        FILES_CHANGED+=("$f")
+    fi
+done
+
+if [[ ${#FILES_CHANGED[@]} -gt 0 ]]; then
+    echo -e "\n✅ Updated versions from $PREVIOUS_VERSION to $LATEST_VERSION in files: \n$(echo "${FILES_CHANGED[@]}" | tr ' ' '\n')"
+    echo -e "\n🥑 To see changes, run \`git diff ${FILES_CHANGED[*]}\`"
+else
+    echo -e "\n✅ All files already use the latest release version $LATEST_VERSION. No files were modified."
+fi

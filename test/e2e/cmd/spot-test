@@ -1,0 +1,289 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+TEST_CONFIG_FILE="$SCRIPTPATH/testdata/aemm-config-integ.json"
+SPOT_IA_TEST_PATH="http://$HOSTNAME:$AEMM_PORT/latest/meta-data/spot/instance-action"
+SPOT_TT_TEST_PATH="http://$HOSTNAME:$AEMM_PORT/latest/meta-data/spot/termination-time"
+RRN_TEST_PATH="http://$HOSTNAME:$AEMM_PORT/latest/meta-data/events/recommendations/rebalance"
+FLAG_OVERRIDDEN_INSTANCE_ACTION="hibernate"
+ENV_OVERRIDDEN_INSTANCE_ACTION="stop"
+FLAG_OVERRIDDEN_TERMINATION_TIME="2025-05-05T05:05:55Z"
+CONFIG_OVERRIDDEN_TERMINATION_TIME="2020-01-07T01:03:47Z"
+FLAG_OVERRIDDEN_NOTICE_TIME="2010-10-26T11:11:11Z"
+SPOT_DELAY=10
+REBALANCE_DELAY=5
+
+function test_spot_paths() {
+  pid=$1
+  tput setaf $MAGENTA
+  health_check $SPOT_IA_TEST_PATH
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  actual_paths=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://$HOSTNAME:$AEMM_PORT/latest/meta-data)
+  expected_paths=$(cat $SCRIPTPATH/golden/spot_paths.golden)
+
+  assert_value "$actual_paths" "$expected_paths" "test_spot_paths"
+
+  clean_up $pid
+}
+
+function test_spot_ia_defaults() {
+  pid=$1
+  tput setaf $MAGENTA
+  health_check $SPOT_IA_TEST_PATH
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  actual_inst_action=$(get_value '"action"' "$response")
+  actual_ia_time=$(get_value '"time"' "$response")
+
+  assert_value "$actual_inst_action" $SPOT_INSTANCE_ACTION_DEFAULT 'Default spot_ia::action val'
+  assert_format "$actual_ia_time" $SPOT_DATE_REGEX 'Default spot_ia::time format'
+
+  actual_term_time=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_TT_TEST_PATH)
+
+  actual_term_time_sec=$(convert_RFC3339_to_sec $actual_term_time)
+  actual_ia_time_sec=$(convert_RFC3339_to_sec $actual_ia_time)
+
+  # times should be within 5 second range
+  assert_value_within_range $actual_term_time_sec $actual_ia_time_sec 5
+
+  clean_up $pid
+}
+
+function test_spot_ia_overrides() {
+  pid=$1
+  expected_inst_action=$2
+  expected_term_time=$3
+  tput setaf $MAGENTA
+  health_check $SPOT_IA_TEST_PATH
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  actual_inst_action=$(get_value '"action"' "$response")
+  actual_ia_time=$(get_value '"time"' "$response")
+
+  assert_value "$actual_inst_action" $expected_inst_action 'Override spot_ia::action'
+
+  actual_ia_time_sec=$(convert_RFC3339_to_sec $actual_ia_time)
+  expected_term_time_sec=$(convert_RFC3339_to_sec $expected_term_time)
+
+  # times should be within 5 second range
+  assert_value_within_range $actual_ia_time_sec $expected_term_time_sec 5
+
+  actual_term_time=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_TT_TEST_PATH)
+  actual_term_time_sec=$(convert_RFC3339_to_sec $actual_term_time)
+
+  # times should be within 5 second range
+  assert_value_within_range $actual_term_time_sec $actual_ia_time_sec 5
+
+  clean_up $pid
+}
+
+function test_spot_404() {
+  pid=$1
+  expected_response=$(cat $SCRIPTPATH/golden/404_response.golden)
+  tput setaf $MAGENTA
+  health_check $SPOT_IA_TEST_PATH
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  actual_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  assert_value "$actual_response" "$expected_response" "test_spot_404::mock-ip-count"
+
+  clean_up $pid
+}
+
+function test_spot_subcommand_paths_404() {
+  pid=$1
+  test_url="$2"
+  test_name="$3"
+  expected_response=$(cat $SCRIPTPATH/golden/404_response.golden)
+  tput setaf $MAGENTA
+  health_check $SPOT_IA_TEST_PATH
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  actual_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $test_url)
+  assert_value "$actual_response" "$expected_response" "subcommand_paths_404::$test_name"
+
+  clean_up $pid
+}
+
+function test_spot_delay_with_rrn() {
+  pid=$1
+  delay_in_sec=$2
+  expected_rrn_time=$3
+  tput setaf $MAGENTA
+  health_check $RRN_TEST_PATH
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  # spotItn affected by delay, but rebalance recommendation is not
+  expected_spot_delayed_response=$(cat $SCRIPTPATH/golden/404_response.golden)
+  spot_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  rrn_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $RRN_TEST_PATH)
+  rrn_time=$(get_value '"noticeTime"' "$rrn_response")
+  assert_value "$spot_response" "$expected_spot_delayed_response" "test_spot_delay_with_rrn::spot-pre-delay_response"
+  assert_value "$rrn_time" "$expected_rrn_time" "test_spot_delay_with_rrn::rrn-pre-delay_response"
+
+  # ensure no impact to mock-delay functionality
+  echo "⏲ Waiting on delay ⏲"
+  sleep $delay_in_sec
+  spot_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  assert_not_equal "$spot_response" "$expected_spot_delayed_response" "test_spot_delay_with_rrn::post-delay_response"
+
+  # Confirm response isn't empty
+  if [[ ! -z $spot_response ]]; then
+    echo "✅ Verified post-delay response"
+  else
+    echo "❌ Failed delay: there should be a response after delay"
+    EXIT_CODE_TO_RETURN=1
+  fi
+
+  clean_up $pid
+}
+
+function test_spot_times_overrides() {
+  pid=$1
+  expected_term_time=$2
+  expected_rrn_time=$3
+  tput setaf $MAGENTA
+  health_check $SPOT_IA_TEST_PATH
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  spot_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  rrn_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $RRN_TEST_PATH)
+  spot_term_time=$(get_value '"time"' "$spot_response")
+  rrn_time=$(get_value '"noticeTime"' "$rrn_response")
+
+  assert_value "$spot_term_time" "$expected_term_time" "test_spot_times_overrides::spot-term-time"
+  assert_value "$rrn_time" "$expected_rrn_time" "test_spot_times_overrides::rrn-notice-time"
+
+  clean_up $pid
+}
+
+function test_spot_and_rebalance_delay() {
+  pid=$1
+  spot_delay_in_sec=$2
+  rebalance_delay_in_sec=$3
+  tput setaf $MAGENTA
+  health_check "http://$HOSTNAME:$AEMM_PORT"
+  TOKEN=$(get_v2Token $MAX_TOKEN_TTL $AEMM_PORT)
+
+  # spotItn + rebalanceRec are both affected by delay
+  expected_delayed_response=$(cat $SCRIPTPATH/golden/404_response.golden)
+  spot_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  assert_value "$spot_response" "$expected_delayed_response" "test_spot_and_rebalance_delay::spot-delay_response"
+  rrn_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $RRN_TEST_PATH)
+  assert_value "$rrn_response" "$expected_delayed_response" "test_spot_and_rebalance_delay::rebalance-delay_response"
+
+  # test assumes spot delay is greater for simplicity and real world simulation
+  echo "⏲ Waiting on spot delay ⏲"
+  sleep $spot_delay_in_sec
+  spot_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $SPOT_IA_TEST_PATH)
+  assert_not_equal "$spot_response" "$expected_delayed_response" "test_spot_and_rebalance_delay::spot-post-delay_response"
+
+  delay_remaining="$(($spot_delay_in_sec-$rebalance_delay_in_sec))"
+
+  echo "⏲ Waiting on rebalance delay ⏲"
+  sleep $delay_remaining
+  rrn_response=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" $RRN_TEST_PATH)
+  assert_not_equal "$rrn_response" "$expected_delayed_response" "test_spot_and_rebalance_delay::rebalance-post-delay_response"
+
+  # Confirm responses aren't empty
+  if [[ ! -z $spot_response ]] && [[ ! -z $rrn_response ]]; then
+    echo "✅ Verified post-delay response"
+  else
+    echo "❌ Failed delay: there should be a response after delay"
+    EXIT_CODE_TO_RETURN=1
+  fi
+
+  clean_up $pid
+}
+
+tput setaf $MAGENTA
+echo "======================================================================================================"
+echo "🥑 Starting spot integration tests $METADATA_VERSION"
+echo "======================================================================================================"
+
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT)
+$start_cmd &
+SPOT_PID=$!
+test_spot_paths $SPOT_PID
+
+$start_cmd &
+SPOT_PID=$!
+test_spot_ia_defaults $SPOT_PID
+
+# flag overrides
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT -a $FLAG_OVERRIDDEN_INSTANCE_ACTION -t $FLAG_OVERRIDDEN_TERMINATION_TIME)
+$start_cmd &
+SPOT_PID=$!
+test_spot_ia_overrides $SPOT_PID $FLAG_OVERRIDDEN_INSTANCE_ACTION $FLAG_OVERRIDDEN_TERMINATION_TIME
+
+# flag + env overrides
+export AEMM_SPOT_ACTION="stop"
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT -t $FLAG_OVERRIDDEN_TERMINATION_TIME)
+$start_cmd &
+SPOT_PID=$!
+test_spot_ia_overrides $SPOT_PID $ENV_OVERRIDDEN_INSTANCE_ACTION $FLAG_OVERRIDDEN_TERMINATION_TIME
+
+# env + config overrides
+export AEMM_SPOT_ACTION="stop"
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT -c $TEST_CONFIG_FILE)
+$start_cmd &
+SPOT_PID=$!
+test_spot_ia_overrides $SPOT_PID $ENV_OVERRIDDEN_INSTANCE_ACTION $CONFIG_OVERRIDDEN_TERMINATION_TIME
+
+# flag + env + config overrides
+export AEMM_SPOT_ACTION="stop"
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT -a $FLAG_OVERRIDDEN_INSTANCE_ACTION -c $TEST_CONFIG_FILE)
+$start_cmd &
+SPOT_PID=$!
+test_spot_ia_overrides $SPOT_PID $FLAG_OVERRIDDEN_INSTANCE_ACTION $CONFIG_OVERRIDDEN_TERMINATION_TIME
+
+unset AEMM_SPOT_ACTION
+
+# paths for other subcommands should be disabled
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT)
+$start_cmd &
+SPOT_PID=$!
+test_spot_subcommand_paths_404 $SPOT_PID "http://$HOSTNAME:$AEMM_PORT/latest/meta-data/events/maintenance/scheduled" "scheduled-maintenance-events"
+
+# --mock-ip-count feature
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT --mock-ip-count=-1)
+$start_cmd &
+SPOT_PID=$!
+test_spot_ia_defaults $SPOT_PID
+
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT --mock-ip-count=0)
+$start_cmd &
+SPOT_PID=$!
+test_spot_404 $SPOT_PID
+
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT -x=1)
+$start_cmd &
+SPOT_PID=$!
+test_spot_ia_defaults $SPOT_PID
+
+# Rebalance Recommendation tests
+# mock delay + flag override
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT -r $FLAG_OVERRIDDEN_NOTICE_TIME --mock-delay-sec $SPOT_DELAY)
+$start_cmd &
+SPOT_PID=$!
+test_spot_delay_with_rrn $SPOT_PID $SPOT_DELAY $FLAG_OVERRIDDEN_NOTICE_TIME
+
+# override spot config times using different sources
+export AEMM_SPOT_REBALANCE_REC_TIME="2111-11-11T11:11:12Z"
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT -t $FLAG_OVERRIDDEN_TERMINATION_TIME)
+$start_cmd &
+SPOT_PID=$!
+test_spot_times_overrides $SPOT_PID $FLAG_OVERRIDDEN_TERMINATION_TIME $AEMM_SPOT_REBALANCE_REC_TIME
+unset AEMM_SPOT_REBALANCE_REC_TIME
+
+# rebalance delay + mock delay
+start_cmd=$(create_cmd $METADATA_VERSION spot --port $AEMM_PORT --mock-delay-sec $SPOT_DELAY --rebalance-delay-sec $REBALANCE_DELAY)
+$start_cmd &
+SPOT_PID=$!
+test_spot_and_rebalance_delay $SPOT_PID $SPOT_DELAY $REBALANCE_DELAY
+
+exit $EXIT_CODE_TO_RETURN

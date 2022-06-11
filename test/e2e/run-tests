@@ -1,0 +1,219 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPTPATH="$(
+  cd "$(dirname "$0")"
+  pwd -P
+)"
+BIN="ec2-metadata-mock"
+HOSTNAME="localhost"
+SPOT_DATE_REGEX='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+SPOT_INSTANCE_ACTION_DEFAULT='terminate'
+EVENTS_DATE_REGEX='^[0-9]{1,2} [A-Z]{1}[a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
+EVENTS_CODE_DEFAULT='system-reboot'
+EVENTS_STATE_DEFAULT='active'
+MAX_TOKEN_TTL="21600"
+EXIT_CODE_TO_RETURN=0
+STARTING_TEST_PORT=1738
+TEST_FILES=$(find $SCRIPTPATH/cmd -type f)
+# Font colors
+RED=1
+GREEN=2
+YELLOW=3
+BLUE=4
+MAGENTA=5
+CYAN=6
+LAVENDER=147
+ORANGE=172
+
+[[ -z $TERM ]] || export TERM=linux
+
+function health_check() {
+  sleep 1
+  while true; do
+    echo "⏳ Waiting for server..."
+    health=$(curl -s $1 || :)
+    # server is ready if ANY response is received
+    if [[ ! -z $health ]]; then
+      echo "======================================================================================================"
+      echo "👍 Started server: $1 👍"
+      echo "======================================================================================================"
+      break
+    fi
+    sleep 1
+  done
+}
+
+function assert_value() {
+  # assert actual == expected
+  if [[ $1 == "$2" ]]; then
+    echo "✅ Verified $3"
+  else
+    echo "❌ Failed $3 verification. Actual: $1 Expected: $2"
+    EXIT_CODE_TO_RETURN=1
+  fi
+}
+
+function assert_value_within_range() {
+  # assert actual == expected within specified range
+  # intended for time comparisons
+  actual=$1
+  expected=$2
+  range=$3
+  difference=$(($actual - $expected))
+  if [[ $difference -lt 0 ]]; then
+    difference=$(expr $difference \* -1)
+  fi
+  if [[ $difference -le $range ]]; then
+    echo "✅ Verified actual and expected are within range"
+  else
+    echo "❌ actual and expected are NOT within range"
+    echo "actual: $actual   expected: $expected"
+    EXIT_CODE_TO_RETURN=1
+  fi
+}
+
+function assert_not_equal() {
+  # assert actual != expected
+  if [[ $1 != "$2" ]]; then
+    echo "✅ Verified $3"
+  else
+    echo "❌ Failed $3 verification. Actual and Expected are the same value"
+    EXIT_CODE_TO_RETURN=1
+  fi
+}
+
+function assert_format() {
+  # assert actual format == expected format
+  if [[ $1 =~ $2 ]]; then
+    echo "✅ Validated $3 format"
+  else
+    echo "❌ Failed $3 format validation"
+    EXIT_CODE_TO_RETURN=1
+  fi
+}
+
+function get_value() {
+  # Extracts value from a given JSON key, $1 without quotes
+  output=$(echo $2 | jq -r 'if type=="array" then .[] else . end | .'$1'')
+  if [[ $output ]]; then
+    echo "$output"
+  else
+    echo "Value not found"
+  fi
+}
+
+function get_v2Token() {
+  TTL=$1
+  port=$2
+  token=$(curl -X PUT "$HOSTNAME:$port/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: $TTL")
+  echo "$token"
+}
+
+function create_cmd() {
+  # Creates AEMM CLI command and applies imdsv2 arg, if necessary
+  imds_version=$1
+  shift # shifts all params down by one. $3 -> $2; $2 -> $1
+  cmd_args="$*"
+  cmd="$SCRIPTPATH/../../build/$BIN $cmd_args"
+  if [[ "$imds_version" == "v2" ]]; then
+    cmd="$cmd --imdsv2"
+  fi
+  echo "$cmd"
+}
+
+function convert_RFC3339_to_sec() {
+  RFC3339_timestamp=$1
+  time_in_sec=""
+  os=$(uname)
+  if [[ "$os" == "Darwin" ]]; then
+    time_in_sec=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$RFC3339_timestamp" +"%s")
+  elif [[ "$os" == "Linux" ]]; then
+    time_in_sec=$(date -d"$RFC3339_timestamp" +"%s")
+  fi
+  echo "$time_in_sec"
+}
+
+function clean_up() {
+  kill "$@" || :
+  sleep 1
+  echo "======================================================================================================"
+  echo "💀 Killed server 💀"
+  echo "======================================================================================================"
+  tput sgr0 # Reset color
+}
+
+function fail_and_clean_up() {
+  echo "======================================================================================================"
+  echo "❌ One or more tests failed ❌"
+  echo "======================================================================================================"
+
+  pids=$(pgrep -f $BIN || :)
+  if [[ $pids ]]; then
+    echo "🧹 Cleaning up $BIN PIDs 🧹"
+    for pid in $pids; do
+      echo "Killing pid: $pid"
+      kill "$pid" || :
+    done
+  fi
+
+  tput sgr0 # Reset color
+}
+
+### exported vars and funcs that tests can use
+export BIN
+export SCRIPTPATH
+export RED
+export GREEN
+export YELLOW
+export BLUE
+export MAGENTA
+export CYAN
+export LAVENDER
+export ORANGE
+export HOSTNAME
+export SPOT_INSTANCE_ACTION_DEFAULT
+export EVENTS_STATE_DEFAULT
+export EVENTS_CODE_DEFAULT
+export EVENTS_DATE_REGEX
+export SPOT_DATE_REGEX
+export MAX_TOKEN_TTL
+export EXIT_CODE_TO_RETURN
+
+export -f health_check
+export -f assert_value
+export -f assert_value_within_range
+export -f assert_not_equal
+export -f assert_format
+export -f get_value
+export -f get_v2Token
+export -f create_cmd
+export -f convert_RFC3339_to_sec
+export -f clean_up
+
+trap "fail_and_clean_up" INT TERM ERR
+
+tput setaf $RED
+echo "======================================================================================================"
+echo "🥑 Starting AEMM integration tests"
+echo "======================================================================================================"
+
+i=0
+for md_version in $(seq 1 2); do
+  for test_file in $TEST_FILES; do
+    AEMM_PORT=$(expr $i + $STARTING_TEST_PORT)
+    export AEMM_PORT
+    export METADATA_VERSION="v$md_version"
+    i=$(expr $i + 1)
+    $test_file
+  done
+done
+
+tput setaf $GREEN
+echo "======================================================================================================"
+echo "✅ All tests passed! ✅"
+echo "======================================================================================================"
+tput sgr0
+
+exit $EXIT_CODE_TO_RETURN
